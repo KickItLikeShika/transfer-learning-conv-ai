@@ -12,10 +12,10 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 import ignite.distributed as idist
 from ignite.engine import Engine, Events
-from ignite.handlers import ModelCheckpoint
-from ignite.metrics import Accuracy, Loss, RunningAverage
+from ignite.handlers import ModelCheckpoint, global_step_from_engine
+from ignite.metrics import Accuracy, Loss, RunningAverage, MetricsLambda
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
-from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
+from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger, OutputHandler, OptimizerParamsHandler
 from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
@@ -29,13 +29,14 @@ PADDED_INPUTS = ["input_ids", "lm_labels", "token_type_ids"]
 
 logger = logging.getLogger(__file__)
 
-# def average_distributed_scalar(scalar, args):
-#     """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
-#     if args.local_rank == -1:
-#         return scalar
-#     scalar_t = torch.tensor(scalar, dtype=torch.float, device=args.device) / torch.distributed.get_world_size()
-#     torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
-#     return scalar_t.item()
+
+def average_distributed_scalar(scalar, args):
+    """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
+    if args.local_rank == -1:
+        return scalar
+    scalar_t = torch.tensor(scalar, dtype=torch.float, device=args.device) / torch.distributed.get_world_size()
+    torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
+    return scalar_t.item()
 
 
 def pad_dataset(dataset, padding=0):
@@ -123,6 +124,9 @@ def train(local_rank, args):
 
     device = idist.device()  # Get current device according to dist_backend: cuda or cuda:local_rank or xla:local_rank
 
+    args.local_rank = local_rank
+    args.device = device
+
     logger.info("Prepare tokenizer, pretrained model and optimizer.")
     tokenizer_class = GPT2Tokenizer if "gpt2" in args.model_checkpoint else OpenAIGPTTokenizer # cant use Autotokenizer because checkpoint could be a Path
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
@@ -196,7 +200,7 @@ def train(local_rank, args):
         evaluator.run(val_loader)
 
     # Make sure distributed data samplers split the dataset nicely between the distributed processes
-    if args.distributed:
+    if args.dist_backend:
         trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
         evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
 
@@ -264,7 +268,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default="", help="Output log folder of the trained models and TensorBoard logs")
 
     possible_dist_backends = [None, "nccl", "gloo", "xla-tpu"]
-    parser.add_argument("--dist_backend", type=str, default=None, choice=possible_dist_backends, 
+    parser.add_argument("--dist_backend", type=str, default=None, choices=possible_dist_backends, 
                         help="Distributed backends. (None, not distributed)")
     args = parser.parse_args()
 
